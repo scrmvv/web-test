@@ -106,7 +106,8 @@ button.secondary{background:#e7ebf2;color:#22395b}
     const u = new URL(API);
     validApi = u.protocol === 'https:' || (u.protocol === 'http:' && ['127.0.0.1', 'localhost'].includes(u.hostname));
   } catch (_) { /* Missing URL */ }
-  let attempt = null, current = 0, busy = false, clockOffset = 0, timerId = null, finishing = false;
+  let attempt = null, current = 0, clockOffset = 0, timerId = null, finishing = false;
+  let saveTimer = null, saveInFlight = null, dirty = false, saveError = '';
 
   function show(screen) {
     for (const id of ['startScreen', 'testScreen', 'result']) $(id).classList.toggle('hidden', id !== screen);
@@ -139,10 +140,14 @@ button.secondary{background:#e7ebf2;color:#22395b}
     return payload;
   }
   function saveSession() {
-    if (attempt) localStorage.setItem(key, JSON.stringify({api: API, attempt_id: attempt.attempt_id}));
+    if (attempt) localStorage.setItem(key, JSON.stringify({
+      api: API, attempt_id: attempt.attempt_id, draft_answers: attempt.answers
+    }));
   }
   function onSession(data) {
     attempt = data;
+    dirty = false;
+    saveError = '';
     syncClock(data.server_now);
     saveSession();
     if (data.status === 'finished') return displayResult(data.result);
@@ -180,7 +185,19 @@ button.secondary{background:#e7ebf2;color:#22395b}
     $('startBtn').disabled = true;
     try {
       const data = await api('/api/resume', {attempt_id: stored.attempt_id});
+      // Recover answers chosen just before a network failure or page reload.
+      let recovered = false;
+      if (data.status !== 'finished' && Array.isArray(stored.draft_answers)
+          && stored.draft_answers.length === data.answers.length) {
+        stored.draft_answers.forEach((value, index) => {
+          if (Number.isInteger(value) && value >= 0 && value < 4 && data.answers[index] !== value) {
+            data.answers[index] = value;
+            recovered = true;
+          }
+        });
+      }
       onSession(data);
+      if (recovered) scheduleSave();
     } catch (e) { error('startError', 'Не удалось восстановить попытку: ' + e.message); }
     finally { $('startBtn').disabled = false; }
   }
@@ -198,7 +215,7 @@ button.secondary{background:#e7ebf2;color:#22395b}
       input.name = 'answer';
       input.value = String(i);
       input.checked = attempt.answers[current] === i;
-      input.disabled = busy;
+      input.disabled = finishing;
       const span = document.createElement('span');
       span.textContent = text;
       label.append(input, span);
@@ -206,50 +223,84 @@ button.secondary{background:#e7ebf2;color:#22395b}
       box.append(label);
     });
     $('progressBar').style.width = `${(current + 1) * 100 / attempt.questions.length}%`;
-    $('prevBtn').disabled = busy || current === 0;
-    $('nextBtn').disabled = busy || attempt.answers[current] === null;
+    $('prevBtn').disabled = finishing || current === 0;
+    $('nextBtn').disabled = finishing || attempt.answers[current] === null;
     $('nextBtn').textContent = current === attempt.questions.length - 1 ? 'Завершить тест' : 'Следующий вопрос';
   }
-  async function choose(i) {
-    if (busy || !attempt || attempt.status === 'finished') return;
-    busy = true;
-    error('testError', '');
-    $('savingStatus').textContent = 'Сохранение…';
-    renderQuestion();
+  function paintSaveStatus() {
+    if (finishing || !attempt || attempt.status === 'finished') return;
+    $('savingStatus').textContent = saveError ? 'Нет связи с сервером' :
+      (dirty || saveInFlight ? 'Сохранение…' : 'Сохранено');
+  }
+  function scheduleSave() {
+    if (!attempt || attempt.status === 'finished') return;
+    dirty = true;
+    saveError = '';
+    clearTimeout(saveTimer);
+    paintSaveStatus();
+    // Batch rapid changes, without delaying clicks or navigation.
+    saveTimer = setTimeout(sendSnapshot, 250);
+  }
+  async function sendSnapshot() {
+    if (!attempt || finishing || attempt.status === 'finished' || !dirty || saveInFlight) return;
+    const session = attempt;
+    const snapshot = session.answers.slice();
+    dirty = false;
+    saveInFlight = api('/api/answers', {
+      attempt_id: session.attempt_id,
+      answers: snapshot,
+    });
+    paintSaveStatus();
     try {
-      const r = await api('/api/answer', {
-        attempt_id: attempt.attempt_id,
-        question_index: current,
-        choice_index: i,
-      });
-      attempt.answers[current] = i;
-      syncClock(r.server_now);
-      $('savingStatus').textContent = 'Сохранено';
+      const response = await saveInFlight;
+      if (attempt !== session || session.status === 'finished') return;
+      syncClock(response.server_now);
+      saveError = '';
     } catch (e) {
-      $('savingStatus').textContent = '';
-      error('testError', e.message);
-      if (e.message.includes('завершена')) finishTest();
+      if (attempt !== session || session.status === 'finished') return;
+      dirty = true;
+      saveError = e.message;
+      error('testError', 'Ответы пока не сохранились на сервере. Проверьте соединение. ' + e.message);
     } finally {
-      busy = false;
-      renderQuestion();
+      saveInFlight = null;
+      if (attempt === session && session.status !== 'finished') {
+        paintSaveStatus();
+        if (dirty && !saveError && !finishing) {
+          clearTimeout(saveTimer);
+          saveTimer = setTimeout(sendSnapshot, 0);
+        }
+      }
     }
+  }
+  function choose(i) {
+    if (finishing || !attempt || attempt.status === 'finished') return;
+    // The UI updates at once; the backend never sends answer keys.
+    attempt.answers[current] = i;
+    error('testError', '');
+    saveSession();
+    renderQuestion();
+    scheduleSave();
   }
   function tick() {
     if (!attempt || finishing) return;
     const left = Math.max(0, Math.ceil((Date.parse(attempt.deadline_at) - (Date.now() + clockOffset)) / 1000));
     $('timer').textContent = duration(left);
     $('timer').style.color = left <= 300 ? '#c0392b' : '#b35400';
-    if (left === 0 && !busy) finishTest();
+    if (left === 0) finishTest();
   }
   async function finishTest() {
-    if (!attempt || finishing || busy) return;
+    if (!attempt || finishing) return;
     finishing = true;
+    clearTimeout(saveTimer);
     $('prevBtn').disabled = true;
     $('nextBtn').disabled = true;
     $('savingStatus').textContent = 'Завершение…';
     error('testError', '');
     try {
-      const data = await api('/api/finish', {attempt_id: attempt.attempt_id});
+      const data = await api('/api/finish', {
+        attempt_id: attempt.attempt_id,
+        answers: attempt.answers,
+      });
       attempt.status = 'finished';
       displayResult(data.result);
     } catch (e) {
@@ -257,7 +308,10 @@ button.secondary{background:#e7ebf2;color:#22395b}
       $('savingStatus').textContent = 'Не удалось завершить';
     } finally {
       finishing = false;
-      if (attempt.status !== 'finished') renderQuestion();
+      if (attempt.status !== 'finished') {
+        renderQuestion();
+        if (dirty) scheduleSave();
+      }
     }
   }
   function displayResult(r) {
@@ -274,16 +328,19 @@ button.secondary{background:#e7ebf2;color:#22395b}
   }
   $('startForm').addEventListener('submit', start);
   $('prevBtn').addEventListener('click', () => {
-    if (!busy && current > 0) { current--; renderQuestion(); }
+    if (!finishing && current > 0) { current--; renderQuestion(); }
   });
   $('nextBtn').addEventListener('click', () => {
-    if (busy || attempt.answers[current] === null) return;
+    if (finishing || attempt.answers[current] === null) return;
     if (current === attempt.questions.length - 1) finishTest();
     else { current++; renderQuestion(); }
   });
   $('otherStudentBtn').addEventListener('click', () => {
     localStorage.removeItem(key);
     attempt = null;
+    clearTimeout(saveTimer);
+    dirty = false;
+    saveError = '';
     $('startForm').reset();
     error('startError', '');
     show('startScreen');
